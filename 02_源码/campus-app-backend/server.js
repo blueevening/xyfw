@@ -6,11 +6,16 @@ const crypto = require('crypto');
 const TOKEN_SECRET = process.env.TOKEN_SECRET || 'campus-app-demo-secret-change-me';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
+// 登录暴力破解防护：同一账号+来源连续失败达到上限后锁定一段时间
+const LOGIN_MAX_FAILS = 5;
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const loginFailures = new Map();
+
 // 模拟数据
 const users = [
-  { id: 1, studentId: '2021001', password: 'e10adc3949ba59abbe56e057f20f883e', username: '张三', role: 0, avatar: null, college: '人工智能学院', major: '移动互联应用技术' },
-  { id: 2, studentId: '2021002', password: 'e10adc3949ba59abbe56e057f20f883e', username: '李四', role: 0, avatar: null, college: '人工智能学院', major: '移动互联应用技术' },
-  { id: 7, studentId: 'admin', password: 'e10adc3949ba59abbe56e057f20f883e', username: '系统管理员', role: 2, avatar: null, college: '信息中心', major: null }
+  { id: 1, studentId: '2021001', password: '951fdaf97cabe4477b02e1a6ac14beb9', username: '张三', role: 0, avatar: null, college: '人工智能学院', major: '移动互联应用技术' },
+  { id: 2, studentId: '2021002', password: '951fdaf97cabe4477b02e1a6ac14beb9', username: '李四', role: 0, avatar: null, college: '人工智能学院', major: '移动互联应用技术' },
+  { id: 7, studentId: 'admin', password: '951fdaf97cabe4477b02e1a6ac14beb9', username: '系统管理员', role: 2, avatar: null, college: '信息中心', major: null }
 ];
 
 const courses = [
@@ -122,9 +127,24 @@ const permissionDefs = [
   { key: 'admin', label: '管理员', role: 2, perms: ['*'] }
 ];
 
-// MD5 简化实现（仅用于演示；生产应改为 bcrypt/argon2）
-function md5(str) {
-  return crypto.createHash('md5').update(str).digest('hex');
+// 演示用固定盐；生产环境应改为每用户独立盐并使用 bcrypt/argon2
+const PASSWORD_SALT = process.env.PASSWORD_SALT || 'campus-demo-salt-2026';
+
+// 加盐 MD5（仅用于演示；生产应改为 bcrypt/argon2）
+function hashPassword(plain) {
+  return crypto.createHash('md5').update(PASSWORD_SALT + String(plain)).digest('hex');
+}
+
+// 记录一次登录失败，返回当前连续失败次数；达到上限则进入锁定
+function recordLoginFailure(key) {
+  const rec = loginFailures.get(key) || { fails: 0, lockUntil: 0 };
+  rec.fails += 1;
+  if (rec.fails >= LOGIN_MAX_FAILS) {
+    rec.lockUntil = Date.now() + LOGIN_LOCK_MS;
+    rec.fails = 0;
+  }
+  loginFailures.set(key, rec);
+  return rec.fails;
 }
 
 function b64url(input) {
@@ -205,16 +225,27 @@ const server = http.createServer((req, res) => {
     if (path === '/api/user/login' && method === 'POST') {
       // 登录
       const { studentId, password } = requestData;
+      const clientIp = req.socket.remoteAddress || '';
+      const loginKey = studentId + '|' + clientIp;
+      const currentLock = loginFailures.get(loginKey);
+      if (currentLock && currentLock.lockUntil && Date.now() < currentLock.lockUntil) {
+        const waitSec = Math.ceil((currentLock.lockUntil - Date.now()) / 1000);
+        res.end(JSON.stringify({ code: 429, message: '登录失败次数过多，请 ' + waitSec + ' 秒后再试' }));
+        return;
+      }
       const user = users.find(u => u.studentId === studentId);
       if (!user) {
+        recordLoginFailure(loginKey);
         res.end(JSON.stringify({ code: 500, message: '用户不存在' }));
         return;
       }
-      const encryptedPassword = md5(password);
+      const encryptedPassword = hashPassword(password);
       if (user.password !== encryptedPassword) {
-        res.end(JSON.stringify({ code: 500, message: '密码错误' }));
+        const tries = recordLoginFailure(loginKey);
+        res.end(JSON.stringify({ code: 500, message: '密码错误，还可尝试 ' + Math.max(0, LOGIN_MAX_FAILS - tries) + ' 次' }));
         return;
       }
+      loginFailures.delete(loginKey);
       const newToken = generateToken(user.id, user.username, user.role);
       res.end(JSON.stringify({
         code: 200,
@@ -248,7 +279,7 @@ const server = http.createServer((req, res) => {
         id: nextId,
         studentId,
         username,
-        password: md5(password),
+        password: hashPassword(password),
         role: 0,
         status: 1
       };
@@ -761,7 +792,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ code: 500, message: '请输入原密码和新密码' }));
         return;
       }
-      if (user.password !== md5(oldPassword)) {
+      if (user.password !== hashPassword(oldPassword)) {
         res.end(JSON.stringify({ code: 500, message: '原密码错误' }));
         return;
       }
@@ -769,7 +800,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ code: 500, message: '新密码至少 6 位' }));
         return;
       }
-      user.password = md5(newPassword);
+      user.password = hashPassword(newPassword);
       res.end(JSON.stringify({ code: 200, message: '密码修改成功，请重新登录' }));
     } else if (path === '/api/course/list' && method === 'GET') {
       if (!tokenData) {
@@ -1030,7 +1061,7 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ code: 500, message: '用户不存在' }));
         return;
       }
-      user.password = md5('123456');
+      user.password = hashPassword('123456');
       res.end(JSON.stringify({ code: 200, message: '密码已重置为 123456' }));
     } else if (path.match(/^\/api\/admin\/users\/\d+\/role$/) && method === 'PUT') {
       if (!tokenData || tokenData.role < 2) {
@@ -1106,10 +1137,16 @@ const server = http.createServer((req, res) => {
   });
 });
 
-const PORT = 8080;
+const PORT = Number(process.env.PORT) || 8080;
 server.listen(PORT, () => {
   console.log('============================================');
   console.log('   校园综合服务App后端启动成功！');
   console.log('   访问地址: http://localhost:' + PORT);
   console.log('============================================');
+  if (!process.env.TOKEN_SECRET) {
+    console.log('[安全警告] 未设置 TOKEN_SECRET 环境变量，正在使用演示默认密钥，请勿用于生产环境。');
+  }
+  if (CORS_ORIGIN === '*') {
+    console.log('[安全警告] CORS 当前对所有来源开放（CORS_ORIGIN=*），生产环境请限制为指定域名。');
+  }
 });
